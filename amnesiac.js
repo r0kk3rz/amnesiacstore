@@ -46,13 +46,235 @@ var secp256k1 = require('secp256k1');
 var shajs = require('sha.js');
 var AWS = require('aws-sdk')
 
+var constants = require('constants')
 
 var myCredentials = new AWS.SharedIniFileCredentials({profile: 'default'});
 var awsconfig = new AWS.Config({
-  credentials: myCredentials, region: 'eu-west-1'
+  credentials: myCredentials, region: constants.AWSregion
 });
 
+function getHash(data) {
+  return crypto.createHash('sha256').update(fromHex(data)).digest().toString('hex')
+}
+
+function fromHex(data) {
+  return Buffer.from(data, 'hex')
+}
+
+/**
+ * 
+ * @param {*} authpubkey 
+ * @param {*} revokepubkey 
+ * @param {*} data 
+ * @param {*} callback 
+ */
+function s3FMSStore(authpubkey, revokepubkey, data, callback) {
+
+  // XXX validate this is valid public keys
+  if (authpubkey === revokepubkey) {
+    callback({'status' : 'error'})
+    return
+  }
+
+  var s3key_authpubkey = getHash(authpubkey)
+  var s3key_revokepubkey = getHash(revokepubkey)
+  console.log(s3key_authpubkey)
+
+  let params_1 = {Bucket: constants.FMSBucket, Key: s3key_authpubkey, Body: JSON.stringify(data)}
+
+  s3.upload(params_1).promise().then((data) => {
+    let params_2 = {Bucket: constants.FMSBucket, Key: s3key_revokepubkey, Body: fromHex(s3key_authpubkey)}
+    s3.upload(params_2).promise().then((data) => {
+       callback({'status': 'ok'})
+    }).catch((err) => {
+       callback({'error': err})
+    })
+ }).catch((err) => {
+   callback({'error': err})
+ })
+}
+
+/**
+ * 
+ * @param {*} signature 
+ * @param {*} recovery 
+ * @param {*} hash 
+ * @param {*} callback 
+ */
+function s3FMSFetch(signature, recovery, hash, callback) {
+
+  var pubkey = secp256k1.publicKeyConvert(secp256k1.recover(fromHex(hash), fromHex(signature), recovery), false);
+    
+  var s3key_authpubkey = getHash(pubkey)
+  console.log(s3key_authpubkey)
+  
+  let params_1 = {Bucket: constants.FMSBucket, Key: s3key_authpubkey}
+  s3.getObject(params_1).promise().then((data) => {
+    callback({'data' : JSON.parse(data.Body)})
+  }).catch((err) => {
+    callback({'error': err})
+  })
+}
+
+/**
+ * 
+ * @param {*} signature 
+ * @param {*} recovery 
+ * @param {*} hash 
+ * @param {*} callback 
+ */
+function s3FMSRevoke(signature, recovery, hash, callback) {
+  var pubkey = secp256k1.publicKeyConvert(secp256k1.recover(hash, fromHex(signature), recovery), false);
+  var s3key_revokepubkey = getHash(pubkey)
+
+  let params_1 = {Bucket: constants.FMSBucket, Key: s3key_revokepubkey}
+  s3.getObject(params_1).promise().then((data) => {
+    let params_2 = {Bucket: constants.FMSBucket, Key: data.Body.toString('hex')}
+    console.log(data.Body.toString('hex'))
+    s3.deleteObject(params_2).promise().then((data) => {
+      s3.deleteObject(params_1).promise().then((data) => {
+        callbackl({'status' : 'ok'})
+      }).catch((err) => {
+        callback({'error': err})
+      })
+    }).catch((err) => {
+      callback({'error': err})
+    })
+  }).catch((err) => {
+    callback({'error': err})
+  })
+}
+
+/**
+ * 
+ * @param {*} signature 
+ * @param {*} recovery 
+ * @param {*} data 
+ * @param {*} callback 
+ */
+function s3PermaStore(signature, recovery, data, callback) {
+  var hash = getHash(data)
+
+  var pubkey = secp256k1.publicKeyConvert(secp256k1.recover(hash, signature, recovery), false);
+  var s3key_pubkeyhash = getHash(pubkey)
+
+  var upload = { sig: signature, recovery: recovery, data: data }
+  let params_1 = {Bucket: constants.PermastoreBucket, Key: s3key_pubkeyhash, Body: JSON.stringify(upload)}
+  
+  s3.upload(params_1).promise().then((data) => {
+    callback({'status': 'ok', 'pubkey': pubkey.toString('hex')})
+  }).catch((err) => {
+    callback({'error': err})
+  })
+}
+
+/**
+ * 
+ * @param {*} pubkey 
+ * @param {*} callback 
+ */
+function s3PermaFetch(pubkey, callback) {
+  var s3key_pubkeyhash = getHash(pubkey)
+  let params_1 = {Bucket: constants.PermastoreBucket, Key: s3key_pubkeyhash}
+
+  s3.getObject(params_1).promise().then((data) => {
+    callback({'data' : JSON.parse(data.Body)})
+  }).catch((err) => {
+    callback({'error': err})
+  })
+}
+
+/**
+ * 
+ * @param {*} recipient 
+ * @param {*} data 
+ * @param {*} callback 
+ */
+function s3MailboxStore(recipient, data, callback) {
+  var mbox_hash = getHash(recipient)
+  var attached_data = fromHex(data)
+
+  var ad_hash = getHash(attached_data)
+
+  let params_1 = {Bucket: constants.PermastoreBucket, Key: 'mbox/' + mbox_hash + '/' + ad_hash, Body: Buffer.from(data)}
+  s3.upload(params_1).promise().then((data) => {
+    callback({'status': 'ok', 'key': 'mbox/' + mbox_hash + '/' + ad_hash})
+  }).catch((err) => {
+    callback({'error': err})
+  })
+}
+
+/**
+ * 
+ * @param {*} recipient 
+ * @param {*} callback 
+ */
+function s3MailboxList(recipient, callback) {
+
+   // FIXME: add ability for truncated lists (>1000 objects)
+   var mbox_hash = getHash(recipient, 'hex')
+   let params_1 = {Bucket: constants.PermastoreBucket, Prefix: 'mbox/' + mbox_hash + '/'}
+   
+   s3.listObjectsV2(params_1).promise().then((data) => {
+     var allKeys = []
+     data.Contents.forEach(function (content) {
+        allKeys.push(content.Key.replace('mbox/' + mbox_hash + '/', ''));
+     });
+     callback({'status': 'ok', 'response': allKeys})
+   }).catch((err) => {
+     callback({'error': err})
+   })
+}
+
+/**
+ * 
+ * @param {*} recipient 
+ * @param {*} hash 
+ * @param {*} callback 
+ */
+function s3MailboxFetch(recipient, hash, callback) {
+  var mbox_hash = getHash(recipient, 'hex')
+  let params_1 = {Bucket: constants.PermastoreBucket, Key: 'mbox/' + mbox_hash + '/' + hash}
+  s3.getObject(params_1).promise().then((data) => {
+    callback({data: data})
+  }).catch((err) => {
+    callback({'error': err})
+  })
+}
+
+/**
+ * 
+ * @param {*} data 
+ * @param {*} callback 
+ */
+function s3IPFSStore(data, callback) {
+  let params_1 = {Bucket: constants.PermastoreBucket, Key: hash, Body: JSON.stringify({data: data})}
+
+  s3.upload(params_1).promise().then((data) => {
+    callback({'status': 'ok', 'hash': hash})
+  }).catch((err) => {
+    callback({'error': err})
+  })
+}
+
+/**
+ * 
+ * @param {*} cid 
+ * @param {*} callback 
+ */
+function s3IPFSFetch(cid, callback) {
+  let params_1 = {Bucket: constants.PermastoreBucket, Key: cid}
+
+  s3.getObject(params_1).promise().then((data) => {
+    callback({'data' : JSON.parse(data.Body).data})
+  }).catch((err) => {
+    callback({'error': err})
+  })
+}
+
+
 var s3 = new AWS.S3({params: 'fms'})
+
 app.use(cors());
 app.use(bodyParser.json({limit: '50mb'})); // support json encoded bodies
 
@@ -61,171 +283,96 @@ app.post('/store', function (req, res) {
       res.send(JSON.stringify({'status': 'error'}))
       return
     }
-    // XXX validate this is valid public keys
+
     var authpubkey = req.body.authpubkey
     var data = req.body.data
     var revokepubkey = req.body.revokepubkey
 
-    if (authpubkey === revokepubkey) {
-      res.send(JSON.stringify({'status': 'error'}))
-      return
-    }
-
-    var s3key_authpubkey = crypto.createHash('sha256').update(Buffer.from(req.body.authpubkey, 'hex')).digest().toString('hex')
-    var s3key_revokepubkey = crypto.createHash('sha256').update(Buffer.from(req.body.revokepubkey, 'hex')).digest().toString('hex')
-    console.log(s3key_authpubkey)
-    let params_1 = {Bucket: 'zg-fms', Key: s3key_authpubkey, Body: JSON.stringify(data)}
-    s3.upload(params_1).promise().then((data) => {
-       let params_2 = {Bucket: 'zg-fms', Key: s3key_revokepubkey, Body: Buffer.from(s3key_authpubkey, 'hex')}
-       s3.upload(params_2).promise().then((data) => {
-          res.send(JSON.stringify({'status': 'ok'}))
-       }).catch((err) => {
-          res.send(JSON.stringify({'error': err}))
-       })
-    }).catch((err) => {
-      res.send(JSON.stringify({'error': err}))
+    s3FMSStore(authpubkey, revokepubkey, data, function(response) {
+      res.send(JSON.stringify(response))
     })
 });
 
-/*
- * /value
- * { 'signature' : hex, 'recovery' : integer, 'nonce' : hex }
- * returns the stored value
-*/
- 
 app.post('/fetch', function (req, res) {
-    var signature = Buffer.from(req.body.sig, 'hex');
+    var signature = req.body.sig;
     var recovery = req.body.recovery;
-
-    var hash = req.body.hash ? Buffer.from(req.body.hash, 'hex') : crypto.createHash('sha256').update(req.body.timestamp).digest();
+    var hash = req.body.hash ? req.body.hash : getHash(req.body.timestamp);
     // XXX check that timestamp is within acceptable timing of now
-    var pubkey = secp256k1.publicKeyConvert(secp256k1.recover(hash, signature, recovery), false);
-    
-    var s3key_authpubkey = crypto.createHash('sha256').update(pubkey).digest().toString('hex')
-    console.log(s3key_authpubkey)
-    
-    let params_1 = {Bucket: 'zg-fms', Key: s3key_authpubkey}
-    s3.getObject(params_1).promise().then((data) => {
-      res.send(JSON.stringify({'data' : JSON.parse(data.Body)}))
-    }).catch((err) => {
-      res.send(JSON.stringify({'error': err}))
+
+    s3FMSFetch(signature, recovery, hash, function(response) {
+      res.send(JSON.stringify(response))
     })
 });
 
 app.post('/revoke', function (req, res) {
-    var signature = Buffer.from(req.body.sig, 'hex');
+    var signature = req.body.sig;
     var recovery = req.body.recovery;
-    var hash = crypto.createHash('sha256').update(req.body.timestamp).digest();
+    var hash = getHash(req.body.timestamp);
 
-    var pubkey = secp256k1.publicKeyConvert(secp256k1.recover(hash, signature, recovery), false);
-    var s3key_revokepubkey = crypto.createHash('sha256').update(pubkey).digest().toString('hex')
-
-    let params_1 = {Bucket: 'zg-fms', Key: s3key_revokepubkey}
-    s3.getObject(params_1).promise().then((data) => {
-      let params_2 = {Bucket: 'zg-fms', Key: data.Body.toString('hex')}
-      console.log(data.Body.toString('hex'))
-      s3.deleteObject(params_2).promise().then((data) => {
-        s3.deleteObject(params_1).promise().then((data) => {
-          res.send(JSON.stringify({'status' : 'ok'}))
-        }).catch((err) => {
-          res.send(JSON.stringify({'error': err}))
-        })
-      }).catch((err) => {
-        res.send(JSON.stringify({'error': err}))
-      })
-    }).catch((err) => {
-      res.send(JSON.stringify({'error': err}))
+    s3FMSRevoke(signature, recovery, hash, function(response){
+      res.send(JSON.stringify(response))
     })
 });
 
 app.post('/perma_store', function (req, res) {
-    var signature = Buffer.from(req.body.sig, 'hex')
+    var signature = fromHex(req.body.sig)
     var recovery = req.body.recovery
-    var hash = crypto.createHash('sha256').update(Buffer.from(req.body.data, 'hex')).digest()
-    var pubkey = secp256k1.publicKeyConvert(secp256k1.recover(hash, signature, recovery), false);
-    var s3key_pubkeyhash = crypto.createHash('sha256').update(pubkey).digest().toString('hex')
-    var data = { sig: req.body.sig, recovery: req.body.recovery, data: req.body.data }
-    let params_1 = {Bucket: 'z-permastore', Key: s3key_pubkeyhash, Body: JSON.stringify(data)}
-    
-    s3.upload(params_1).promise().then((data) => {
-      res.send(JSON.stringify({'status': 'ok', 'pubkey': pubkey.toString('hex')}))
-    }).catch((err) => {
-      res.send(JSON.stringify({'error': err}))
+    var data = req.body.data
+
+    s3PermaStore(signature, recovery, data, function(response){
+      res.send(JSON.stringify(response))
     })
 });
 
 app.post('/ipfs_store', function (req, res) {
-    var hash = crypto.createHash('sha256').update(Buffer.from(req.body.data, 'hex')).digest().toString('hex')
-    let params_1 = {Bucket: 'z-permastore', Key: hash, Body: JSON.stringify({data: req.body.data})}
-    
-    s3.upload(params_1).promise().then((data) => {
-      res.send(JSON.stringify({'status': 'ok', 'hash': hash}))
-    }).catch((err) => {
-      res.send(JSON.stringify({'error': err}))
+    let data = req.body.data
+
+    s3IPFSStore(data, function(response){
+      res.send(JSON.stringify(response))
     })
 });
 
 app.post('/ipfs_fetch', function (req, res) {
-    let params_1 = {Bucket: 'z-permastore', Key: req.body.hash}
-    s3.getObject(params_1).promise().then((data) => {
-      res.send(JSON.stringify({'data' : JSON.parse(data.Body).data}))
-    }).catch((err) => {
-      res.send(JSON.stringify({'error': err}))
+    let hash = req.body.hash
+
+    s3IPFSFetch(hash, function(response){
+      res.send(JSON.stringify(response))
     })
 });
-
 
 app.post('/perma_fetch', function (req, res) {
-    var pubkey = Buffer.from(req.body.pubkey, 'hex')
-    var s3key_pubkeyhash = crypto.createHash('sha256').update(pubkey).digest().toString('hex')
-    var data = { sig: req.body.sig, recovery: req.body.recovery, data: req.body.data }
-    let params_1 = {Bucket: 'z-permastore', Key: s3key_pubkeyhash}
-    s3.getObject(params_1).promise().then((data) => {
-      res.send(JSON.stringify({'data' : JSON.parse(data.Body)}))
-    }).catch((err) => {
-      res.send(JSON.stringify({'error': err}))
+    let pubkey = req.body.pubkey
+
+    s3PermaFetch(pubkey, function(response){
+      res.send(JSON.stringify(response))
     })
 });
 
-app.post('/mailbox_store', function (req, res) { 
-   var mbox_hash = crypto.createHash('sha256').update(Buffer.from(req.body.recipient, 'hex')).digest().toString('hex')
-   var attached_data = Buffer.from(req.body.data, 'hex')
-   var ad_hash = crypto.createHash('sha256').update(attached_data).digest().toString('hex')
-   var data = { data: req.body.data }
-   let params_1 = {Bucket: 'z-permastore', Key: 'mbox/' + mbox_hash + '/' + ad_hash, Body: Buffer.from(req.body.data)}
-   s3.upload(params_1).promise().then((data) => {
-     res.send(JSON.stringify({'status': 'ok', 'key': 'mbox/' + mbox_hash + '/' + ad_hash}))
-   }).catch((err) => {
-     res.send(JSON.stringify({'error': err}))
+app.post('/mailbox_store', function (req, res) {
+   let recipient = req.body.recipient
+   let data = req.body.data
+
+   s3MailboxStore(recipient, data, function(response){
+     res.send(JSON.stringify(response))
    })
 })
 
 app.post('/mailbox_list', function (req, res) { 
-   // FIXME: add ability for truncated lists (>1000 objects)
-   var mbox_hash = crypto.createHash('sha256').update(Buffer.from(req.body.recipient, 'hex')).digest().toString('hex')
-   let params_1 = {Bucket: 'z-permastore', Prefix: 'mbox/' + mbox_hash + '/'}
-   s3.listObjectsV2(params_1).promise().then((data) => {
-     var allKeys = []
-     data.Contents.forEach(function (content) {
-        allKeys.push(content.Key.replace('mbox/' + mbox_hash + '/', ''));
-     });
-     res.send(JSON.stringify({'status': 'ok', 'response': allKeys}))
-   }).catch((err) => {
-     res.send(JSON.stringify({'error': err}))
-   })
+  let recipient = req.body.recipient
+
+  s3MailboxList(recipient, function(response){
+    res.send(JSON.stringify(response))
+  })
 })
 
 app.post('/mailbox_fetch', function (req, res) {
-   var mbox_hash = crypto.createHash('sha256').update(Buffer.from(req.body.recipient, 'hex')).digest().toString('hex')
-   let params_1 = {Bucket: 'z-permastore', Key: 'mbox/' + mbox_hash + '/' + req.body.hash}
-   s3.getObject(params_1).promise().then((data) => {
-     res.send({data: data})
-   }).catch((err) => {
-     res.send(JSON.stringify({'error': err}))
+   let recipient = req.body.recipient
+   let hash = req.body.hash
+
+   s3MailboxFetch(recipient, hash, function(response){
+     res.send(JSON.stringify(response))
    })
 });
-
-
 
 app.get('/health', function (req, res) {
   res.send(JSON.stringify({'notdead' : true}))
